@@ -1,0 +1,177 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Parameters:
+  PublisherCodeBucket:
+    Type: String
+  PublisherCodeKey:
+    Type: String
+
+Resources:
+  NotificationsTopic:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      TopicName: 'rtm-notifications-topic'
+
+  AuditDLQ:
+    Type: 'AWS::SQS::Queue'
+    Properties:
+      QueueName: 'rtm-audit-dlq'
+
+  WebhookDLQ:
+    Type: 'AWS::SQS::Queue'
+    Properties:
+      QueueName: 'rtm-webhook-dlq'
+
+  AuditQueue:
+    Type: 'AWS::SQS::Queue'
+    Properties:
+      QueueName: 'rtm-audit-queue'
+      VisibilityTimeout: 30
+      RedrivePolicy:
+        maxReceiveCount: 5
+        deadLetterTargetArn: !GetAtt AuditDLQ.Arn
+
+  WebhookQueue:
+    Type: 'AWS::SQS::Queue'
+    Properties:
+      QueueName: 'rtm-webhook-queue'
+      VisibilityTimeout: 30
+      RedrivePolicy:
+        maxReceiveCount: 5
+        deadLetterTargetArn: !GetAtt WebhookDLQ.Arn
+
+  AuditQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref AuditQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowSNSSendMessage
+            Effect: Allow
+            Principal: 
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt AuditQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref NotificationsTopic
+
+  WebhookQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref WebhookQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowSNSSendMessage
+            Effect: Allow
+            Principal: 
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt WebhookQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref NotificationsTopic
+
+  AuditSubscription:
+    Type: 'AWS::SNS::Subscription'
+    DependsOn: AuditQueuePolicy
+    Properties:
+      TopicArn: !Ref NotificationsTopic
+      Endpoint: !GetAtt AuditQueue.Arn
+      Protocol: sqs
+      RawMessageDelivery: true
+
+  WebhookSubscription:
+    Type: 'AWS::SNS::Subscription'
+    DependsOn: WebhookQueuePolicy
+    Properties:
+      TopicArn: !Ref NotificationsTopic
+      Endpoint: !GetAtt WebhookQueue.Arn
+      Protocol: sqs
+      RawMessageDelivery: true
+
+  PublisherLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: rtm-publisher-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref NotificationsTopic
+
+
+  PublisherLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: app.lambda_handler
+      Role: !GetAtt PublisherLambdaRole.Arn
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables:
+          TOPIC_ARN: !Ref NotificationsTopic
+      Code:
+        S3Bucket: !Ref PublisherCodeBucket
+        S3Key: !Ref PublisherCodeKey
+
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: rtm-notifications-http-api
+      ProtocolType: HTTP
+
+  PublisherIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt PublisherLambda.Arn
+      PayloadFormatVersion: '2.0'
+
+  NotifyRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "POST /notify"
+      Target: !Join [ "/", [ "integrations", !Ref PublisherIntegration ] ]
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: "$default"
+      AutoDeploy: true
+
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref PublisherLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*/notify"
+
+Outputs:
+  ApiUrl:
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
