@@ -1,12 +1,39 @@
 AWSTemplateFormatVersion: '2010-09-09'
 
 Parameters:
-  PublisherCodeBucket:
+  CodeBucket:
     Type: String
   PublisherCodeKey:
     Type: String
+  AuditConsumerCodeKey:
+    Type: String
 
 Resources:
+  EventsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: "rtm-events-table"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: "eventId"
+          AttributeType: "S"
+        - AttributeName: "eventType"
+          AttributeType: "S"
+        - AttributeName: "timestamp"
+          AttributeType: "S"
+      KeySchema:
+        - AttributeName: "eventId"
+          KeyType: "HASH"
+      GlobalSecondaryIndexes:
+        - IndexName: gsi_eventType_timestamp
+          KeySchema:
+            - AttributeName: eventType
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
   NotificationsTopic:
     Type: 'AWS::SNS::Topic'
     Properties:
@@ -26,7 +53,7 @@ Resources:
     Type: 'AWS::SQS::Queue'
     Properties:
       QueueName: 'rtm-audit-queue'
-      VisibilityTimeout: 30
+      VisibilityTimeout: 60
       RedrivePolicy:
         maxReceiveCount: 5
         deadLetterTargetArn: !GetAtt AuditDLQ.Arn
@@ -133,8 +160,68 @@ Resources:
         Variables:
           TOPIC_ARN: !Ref NotificationsTopic
       Code:
-        S3Bucket: !Ref PublisherCodeBucket
+        S3Bucket: !Ref CodeBucket
         S3Key: !Ref PublisherCodeKey
+  
+  AuditConsumerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: rtm-audit-consumer-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                Resource: !GetAtt EventsTable.Arn
+              # CloudWatch Logs 
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+              # Read from SQS (AuditQueue)
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt AuditQueue.Arn
+
+
+  AuditConsumerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: app.lambda_handler
+      Role: !GetAtt AuditConsumerLambdaRole.Arn
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref EventsTable
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: !Ref AuditConsumerCodeKey
+  
+  AuditEventSourceMapping:
+    DependsOn: AuditConsumerLambda
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt AuditQueue.Arn
+      FunctionName: !Ref AuditConsumerLambda
+      BatchSize: 1
+      Enabled: true
 
   HttpApi:
     Type: AWS::ApiGatewayV2::Api
@@ -170,35 +257,8 @@ Resources:
       Action: lambda:InvokeFunction
       FunctionName: !Ref PublisherLambda
       Principal: apigateway.amazonaws.com
-      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*/notify"
-  
-  EventsTable:
-    Type: AWS::DynamoDB::Table
-    Properties:
-      TableName: "rtm-events-table"
-      BillingMode: PAY_PER_REQUEST
-      AttributeDefinitions:
-        - AttributeName: "eventId"
-          AttributeType: "S"
-        - AttributeName: "eventType"
-          AttributeType: "S"
-        - AttributeName: "timestamp"
-          AttributeType: "S"
-      KeySchema:
-        - AttributeName: "eventId"
-          KeyType: "HASH"
-      GlobalSecondaryIndexes:
-        - IndexName: gsi_eventType_timestamp
-          KeySchema:
-            - AttributeName: eventType
-              KeyType: HASH
-            - AttributeName: timestamp
-              KeyType: RANGE
-          Projection:
-            ProjectionType: ALL
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*/notify" 
       
-
-
 Outputs:
   ApiUrl:
     Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"

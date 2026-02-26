@@ -1,13 +1,14 @@
 import json
 import os
 import boto3
+from datetime import datetime, timezone
+from decimal import Decimal
 from botocore.exceptions import ClientError
 
 TABLE_NAME = os.environ.get("TABLE_NAME", "rtm-events-table")
 
 dynamodb = boto3.resource("dynamodb")
 table = dynamodb.Table(TABLE_NAME)
-
 
 def put_if_absent(item: dict) -> bool:
     try:
@@ -22,7 +23,6 @@ def put_if_absent(item: dict) -> bool:
             return False
         raise
 
-
 def lambda_handler(event, context):
     created_count = 0
     duplicate_count = 0
@@ -31,7 +31,7 @@ def lambda_handler(event, context):
         body_str = record.get("body", "{}")
 
         try:
-            msg = json.loads(body_str)
+            msg = json.loads(body_str, parse_float=Decimal)
         except json.JSONDecodeError:
             raise ValueError(f"Invalid JSON body: {body_str}")
 
@@ -42,11 +42,17 @@ def lambda_handler(event, context):
         if not event_id or not event_type or not timestamp:
             raise ValueError(f"Missing required fields in message: {msg}")
 
+        if event_type == "POISON":
+            raise Exception("Simulated failure")
+
+        print("Processing eventId=", event_id, "eventType=", event_type)
+
         item = {
             "eventId": event_id,
             "eventType": event_type,
             "timestamp": timestamp,
             "payload": msg.get("payload", {}),
+            "processedAt": datetime.now(timezone.utc).isoformat(),
         }
 
         if put_if_absent(item):
@@ -54,10 +60,7 @@ def lambda_handler(event, context):
         else:
             duplicate_count += 1
 
-    
     return {
         "statusCode": 200,
-        "body": json.dumps(
-            {"created": created_count, "duplicates": duplicate_count}
-        ),
+        "body": json.dumps({"created": created_count, "duplicates": duplicate_count}),
     }
