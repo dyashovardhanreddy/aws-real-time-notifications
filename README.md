@@ -4,18 +4,12 @@
 This project implements a production-style event-driven notification system using AWS services.
 
 The system is designed to demonstrate:
-
-Decoupled architecture
-
-Fan-out messaging
-
-Asynchronous processing
-
-Idempotent consumers
-
-Dead Letter Queue (DLQ) handling
-
-Infrastructure-as-Code using CloudFormation
+- Decoupled architecture
+- Fan-out messaging
+- Asynchronous processing
+- Idempotent consumers
+- Dead Letter Queue (DLQ) handling
+- Infrastructure-as-Code using CloudFormation
 
 The architecture follows distributed systems best practices for reliability and scalability.
 
